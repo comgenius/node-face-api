@@ -7,12 +7,12 @@ This project exposes an HTTP API for face detection, comparison, and pose analys
 - **Install dependencies:** `npm install`
 - **Start the API:**
   - `npm start` (runs `server.js`, which exposes health check plus the `/api/check-face` verification endpoint), or
-  - `node app.js` (runs the extended API described below).
+  - `node server.js` (runs the extended API described below).
 - **Model files:** The service loads pre-trained weights from `./models`. Ensure that directory ships with the repository or is mounted when running in Docker.
 
 ### Configuration
 - `PORT` (optional): HTTP port (defaults to `3000`).
-- `MODEL_PATH` (optional, when running `app.js`): set to override the default `./models` directory.
+- `MODEL_PATH` (optional, when running `server.js`): set to override the default `./models` directory.
 
 ### Image Inputs
 Each endpoint accepts either:
@@ -21,7 +21,7 @@ Each endpoint accepts either:
 
 Large base64 payloads can exceed the default request limit; `body-parser` is already configured with a `10mb` ceiling. Increase the limit if you need to send higher-resolution frames.
 
-## API Overview (app.js)
+## API Overview (server.js)
 
 | Method | Path | Purpose |
 | ------ | ---- | ------- |
@@ -107,7 +107,7 @@ Large base64 payloads can exceed the default request limit; `body-parser` is alr
   }
   ```
 - **No face detected:** Responds with `lookingAway: false` and a `metrics.reason` describing the failure (`"no_face_detected"` or `"insufficient_landmarks"`).
-- Thresholds are tuned for frontal faces with moderate head movement; adjust `analyzeLookingAway` in `app.js` if you need stricter criteria.
+- Thresholds are tuned for frontal faces with moderate head movement; adjust `analyzeLookingAway` in `server.js` if you need stricter criteria.
 
 ### `POST /api/compare-face`
 - **Request body:**
@@ -148,7 +148,7 @@ Large base64 payloads can exceed the default request limit; `body-parser` is alr
 ## Error Handling
 - Unexpected inference failures return `500` with `{ "error": "..." }`. Check server logs for stack traces.
 - Network timeouts or invalid URLs throw `"Failed to fetch image"` errors.
-- Responses include minimal metadata to limit payload size; adjust the response builders in `app.js` if additional diagnostics are required.
+- Responses include minimal metadata to limit payload size; adjust the response builders in `server.js` if additional diagnostics are required.
 
 ## Development Notes
 - The face models are loaded on startup. On first boot they may take a few seconds to warm up; subsequent requests are faster because weights stay resident in memory.
