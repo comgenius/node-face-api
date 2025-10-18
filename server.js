@@ -243,7 +243,8 @@ app.post("/api/detect-face", async (req, res) => {
       return res.json({ faceDetected: false });
     }
 
-    res.json({ faceDetected: true, detection });
+    const { landmarks: _omit, ...sanitizedDetection } = detection;
+    res.json({ faceDetected: true, detection: sanitizedDetection });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: "Face detection failed" });
@@ -282,11 +283,12 @@ app.post("/api/looking-away", async (req, res) => {
     }
 
     const analysis = analyzeLookingAway(detection);
+    const { landmarks: __omit, ...sanitizedDetection } = detection;
     res.json({
       faceDetected: true,
       lookingAway: analysis.lookingAway,
       metrics: analysis.metrics,
-      detection,
+      detection: sanitizedDetection,
     });
   } catch (err) {
     console.error(err);
