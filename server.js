@@ -25,7 +25,7 @@ app.get("/health", (req, res) => {
 const { Canvas, Image, ImageData } = canvas;
 faceapi.env.monkeyPatch({ fetch: globalThis.fetch, Canvas, Image, ImageData });
 
-let modelPath = "./models";
+const modelPath = process.env.MODEL_PATH || "./models";
 
 async function loadModels() {
   await faceapi.nets.ssdMobilenetv1.loadFromDisk(modelPath);
@@ -184,47 +184,68 @@ function analyzeLookingAway(detection) {
   };
 }
 
+async function compareFaceImages(referenceImage, capturedImage) {
+  const options = new faceapi.SsdMobilenetv1Options({ minConfidence: 0.5 });
+  const refImage = await loadImageFromSource(referenceImage);
+  const capImage = await loadImageFromSource(capturedImage);
+
+  const refDetection = await faceapi
+    .detectSingleFace(refImage, options)
+    .withFaceLandmarks()
+    .withFaceDescriptor();
+
+  const capDetection = await faceapi
+    .detectSingleFace(capImage, options)
+    .withFaceLandmarks()
+    .withFaceDescriptor();
+
+  if (!refDetection || !capDetection) {
+    return { error: "Face not detected", status: 400 };
+  }
+
+  const faceMatcher = new faceapi.FaceMatcher(refDetection.descriptor, 0.5);
+  const bestMatch = faceMatcher.findBestMatch(capDetection.descriptor);
+
+  console.log("Distance:", bestMatch.distance);
+
+  return {
+    match: bestMatch.distance <= 0.53,
+    similarity: 1 - bestMatch.distance,
+  };
+}
+
 app.post("/api/compare-face", async (req, res) => {
   try {
-    const options = new faceapi.SsdMobilenetv1Options({ minConfidence: 0.5 });
     const { capturedImage, referenceImage } = req.body;
-
-    const refResponse = await fetch(referenceImage);
-    const refArrayBuffer = await refResponse.arrayBuffer();
-    const refBuffer = Buffer.from(refArrayBuffer);
-    const refImage = await canvas.loadImage(refBuffer);
-
-    const refDetection = await faceapi
-      .detectSingleFace(refImage, options)
-      .withFaceLandmarks()
-      .withFaceDescriptor();
-
-    // const base64Data = capturedImage.replace(/^data:image\/png;base64,/, "");
-    // const capturedBuffer = Buffer.from(base64Data, "base64");
-    // const capImage = await canvas.loadImage(capturedBuffer);
-    const capResponse = await fetch(capturedImage);
-    const capArrayBuffer = await capResponse.arrayBuffer();
-    const capBuffer = Buffer.from(capArrayBuffer);
-    const capImage = await canvas.loadImage(capBuffer);
-
-    const capDetection = await faceapi
-      .detectSingleFace(capImage, options)
-      .withFaceLandmarks()
-      .withFaceDescriptor();
-
-    if (!refDetection || !capDetection) {
-      return res.status(400).json({ error: "Face not detected" });
+    if (!referenceImage || !capturedImage) {
+      return res.status(400).json({ error: "referenceImage and capturedImage are required" });
     }
 
-    const faceMatcher = new faceapi.FaceMatcher(refDetection.descriptor, 0.5);
-    const bestMatch = faceMatcher.findBestMatch(capDetection.descriptor);
+    const result = await compareFaceImages(referenceImage, capturedImage);
+    if (result.error) {
+      return res.status(result.status).json({ error: result.error });
+    }
 
-    console.log("Distance:", bestMatch.distance);
+    return res.json(result);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Face comparison failed" });
+  }
+});
 
-    return res.json({
-      match: bestMatch.distance <= 0.53,
-      similarity: 1 - bestMatch.distance,
-    });
+app.post("/api/check-face", async (req, res) => {
+  try {
+    const { capturedImage, referenceImageUrl } = req.body;
+    if (!referenceImageUrl || !capturedImage) {
+      return res.status(400).json({ error: "referenceImageUrl and capturedImage are required" });
+    }
+
+    const result = await compareFaceImages(referenceImageUrl, capturedImage);
+    if (result.error) {
+      return res.status(result.status).json({ error: result.error });
+    }
+
+    return res.json(result);
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: "Face comparison failed" });

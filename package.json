@@ -1,8 +1,8 @@
 {
-  "name": "node_project",
+  "name": "node-face-api",
   "version": "1.0.0",
-  "description": "",
-  "main": "hello.js",
+  "description": "HTTP API for face detection, comparison, and pose analysis",
+  "main": "server.js",
   "scripts": {
     "test": "echo \"Error: no test specified\" && exit 1",
     "start": "node server.js"
