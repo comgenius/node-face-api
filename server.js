@@ -222,7 +222,7 @@ app.post("/api/compare-face", async (req, res) => {
     console.log("Distance:", bestMatch.distance);
 
     return res.json({
-      match: bestMatch.distance <= 0.53,
+      match: bestMatch.distance <= 0.45,
       similarity: 1 - bestMatch.distance,
     });
   } catch (err) {
