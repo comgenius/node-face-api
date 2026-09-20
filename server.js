@@ -1,3 +1,12 @@
+// Node 23+ removed util.isNullOrUndefined / util.isArray; tfjs-node 4.22 still uses them.
+const nodeUtil = require("util");
+if (typeof nodeUtil.isNullOrUndefined !== "function") {
+  nodeUtil.isNullOrUndefined = (v) => v === null || v === undefined;
+}
+if (typeof nodeUtil.isArray !== "function") {
+  nodeUtil.isArray = Array.isArray;
+}
+
 const tf = require("@tensorflow/tfjs-node");
 const express = require("express");
 const bodyParser = require("body-parser");
@@ -15,6 +24,7 @@ try {
 const app = express();
 app.use(cors());
 app.use(bodyParser.json({ limit: "10mb" }));
+app.use(express.static("public"));
 
 // simple health check endpoint for container orchestration
 app.get("/health", (req, res) => {
@@ -25,14 +35,19 @@ app.get("/health", (req, res) => {
 const { Canvas, Image, ImageData } = canvas;
 faceapi.env.monkeyPatch({ fetch: globalThis.fetch, Canvas, Image, ImageData });
 
-let modelPath = "./models";
+const modelPath = process.env.MODEL_PATH || "./models";
 
 async function loadModels() {
   await faceapi.nets.ssdMobilenetv1.loadFromDisk(modelPath);
   await faceapi.nets.faceLandmark68Net.loadFromDisk(modelPath);
   await faceapi.nets.faceRecognitionNet.loadFromDisk(modelPath);
 }
-loadModels();
+const modelsReady = loadModels();
+
+app.use((req, res, next) => {
+  if (!req.path.startsWith("/api/")) return next();
+  modelsReady.then(() => next()).catch(next);
+});
 
 async function loadImageFromSource(source) {
   if (!source) {
@@ -45,13 +60,50 @@ async function loadImageFromSource(source) {
     return canvas.loadImage(buffer);
   }
 
-  const response = await fetch(source);
-  if (!response.ok) {
-    throw new Error(`Failed to fetch image: ${response.status} ${response.statusText}`);
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 8000);
+  try {
+    const response = await fetch(source, { signal: controller.signal });
+    if (!response.ok) {
+      throw new Error(`Failed to fetch image: ${response.status} ${response.statusText}`);
+    }
+    const arrayBuffer = await response.arrayBuffer();
+    const buffer = Buffer.from(arrayBuffer);
+    return canvas.loadImage(buffer);
+  } finally {
+    clearTimeout(timer);
   }
-  const arrayBuffer = await response.arrayBuffer();
-  const buffer = Buffer.from(arrayBuffer);
-  return canvas.loadImage(buffer);
+}
+
+const refDescriptorCache = new Map();
+
+function referenceCacheKey(source) {
+  if (!source) return "";
+  if (source.startsWith("data:")) {
+    return `data:${source.length}:${source.slice(21, 85)}`;
+  }
+  return source;
+}
+
+async function getFaceDescriptor(imageSource, options, { cache = false } = {}) {
+  const key = cache ? referenceCacheKey(imageSource) : null;
+  if (key && refDescriptorCache.has(key)) {
+    return refDescriptorCache.get(key);
+  }
+
+  const image = await loadImageFromSource(imageSource);
+  const detection = await faceapi
+    .detectSingleFace(image, options)
+    .withFaceLandmarks()
+    .withFaceDescriptor();
+
+  if (!detection) {
+    return null;
+  }
+  if (key) {
+    refDescriptorCache.set(key, detection.descriptor);
+  }
+  return detection.descriptor;
 }
 
 async function multipleFaces(imageSource) {
@@ -184,47 +236,123 @@ function analyzeLookingAway(detection) {
   };
 }
 
+async function compareFaceImages(referenceImage, capturedImage) {
+  const options = new faceapi.SsdMobilenetv1Options({ minConfidence: 0.5 });
+  const [refDescriptor, capDescriptor] = await Promise.all([
+    getFaceDescriptor(referenceImage, options, { cache: true }),
+    getFaceDescriptor(capturedImage, options, { cache: false }),
+  ]);
+
+  if (!refDescriptor || !capDescriptor) {
+    return { error: "Face not detected", status: 400 };
+  }
+
+  const faceMatcher = new faceapi.FaceMatcher(refDescriptor, 0.5);
+  const bestMatch = faceMatcher.findBestMatch(capDescriptor);
+
+  console.log("Distance:", bestMatch.distance);
+
+  return {
+    match: bestMatch.distance <= 0.53,
+    similarity: 1 - bestMatch.distance,
+  };
+}
+
+/** Tunable compare: same pipeline as compareFaceImages, but match uses the caller-supplied threshold. */
+async function compareFaceImagesTunable(referenceImage, capturedImage, threshold = 0.53) {
+  const matchThreshold = Number(threshold);
+  if (!Number.isFinite(matchThreshold) || matchThreshold < 0 || matchThreshold > 1) {
+    return { error: "threshold must be a number between 0 and 1", status: 400 };
+  }
+
+  const options = new faceapi.SsdMobilenetv1Options({ minConfidence: 0.5 });
+  const refImage = await loadImageFromSource(referenceImage);
+  const capImage = await loadImageFromSource(capturedImage);
+
+  const refDetection = await faceapi
+    .detectSingleFace(refImage, options)
+    .withFaceLandmarks()
+    .withFaceDescriptor();
+
+  const capDetection = await faceapi
+    .detectSingleFace(capImage, options)
+    .withFaceLandmarks()
+    .withFaceDescriptor();
+
+  if (!refDetection || !capDetection) {
+    return { error: "Face not detected", status: 400 };
+  }
+
+  const distance = faceapi.euclideanDistance(
+    refDetection.descriptor,
+    capDetection.descriptor
+  );
+
+  console.log("Tunable compare — Distance:", distance, "Threshold:", matchThreshold);
+
+  return {
+    match: distance <= matchThreshold,
+    distance,
+    threshold: matchThreshold,
+    similarity: 1 - distance,
+  };
+}
+
 app.post("/api/compare-face", async (req, res) => {
   try {
-    const options = new faceapi.SsdMobilenetv1Options({ minConfidence: 0.5 });
     const { capturedImage, referenceImage } = req.body;
-
-    const refResponse = await fetch(referenceImage);
-    const refArrayBuffer = await refResponse.arrayBuffer();
-    const refBuffer = Buffer.from(refArrayBuffer);
-    const refImage = await canvas.loadImage(refBuffer);
-
-    const refDetection = await faceapi
-      .detectSingleFace(refImage, options)
-      .withFaceLandmarks()
-      .withFaceDescriptor();
-
-    // const base64Data = capturedImage.replace(/^data:image\/png;base64,/, "");
-    // const capturedBuffer = Buffer.from(base64Data, "base64");
-    // const capImage = await canvas.loadImage(capturedBuffer);
-    const capResponse = await fetch(capturedImage);
-    const capArrayBuffer = await capResponse.arrayBuffer();
-    const capBuffer = Buffer.from(capArrayBuffer);
-    const capImage = await canvas.loadImage(capBuffer);
-
-    const capDetection = await faceapi
-      .detectSingleFace(capImage, options)
-      .withFaceLandmarks()
-      .withFaceDescriptor();
-
-    if (!refDetection || !capDetection) {
-      return res.status(400).json({ error: "Face not detected" });
+    if (!referenceImage || !capturedImage) {
+      return res.status(400).json({ error: "referenceImage and capturedImage are required" });
     }
 
-    const faceMatcher = new faceapi.FaceMatcher(refDetection.descriptor, 0.5);
-    const bestMatch = faceMatcher.findBestMatch(capDetection.descriptor);
+    const result = await compareFaceImages(referenceImage, capturedImage);
+    if (result.error) {
+      return res.status(result.status).json({ error: result.error });
+    }
 
-    console.log("Distance:", bestMatch.distance);
+    return res.json(result);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Face comparison failed" });
+  }
+});
 
-    return res.json({
-      match: bestMatch.distance <= 0.53,
-      similarity: 1 - bestMatch.distance,
-    });
+app.post("/api/compare-face-tune", async (req, res) => {
+  try {
+    const { capturedImage, referenceImage, threshold } = req.body;
+    if (!referenceImage || !capturedImage) {
+      return res.status(400).json({ error: "referenceImage and capturedImage are required" });
+    }
+
+    const result = await compareFaceImagesTunable(
+      referenceImage,
+      capturedImage,
+      threshold ?? 0.53
+    );
+    if (result.error) {
+      return res.status(result.status).json({ error: result.error });
+    }
+
+    return res.json(result);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Tunable face comparison failed" });
+  }
+});
+
+app.post("/api/check-face", async (req, res) => {
+  try {
+    const { capturedImage, referenceImageUrl } = req.body;
+    if (!referenceImageUrl || !capturedImage) {
+      return res.status(400).json({ error: "referenceImageUrl and capturedImage are required" });
+    }
+
+    const result = await compareFaceImages(referenceImageUrl, capturedImage);
+    if (result.error) {
+      return res.status(result.status).json({ error: result.error });
+    }
+
+    return res.json(result);
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: "Face comparison failed" });
@@ -296,5 +424,5 @@ app.post("/api/looking-away", async (req, res) => {
   }
 });
 
-const PORT = process.env.PORT || 3000;
+const PORT = process.env.PORT || 3001;
 app.listen(PORT, () => console.log(`Server running on http://localhost:${PORT}`));
