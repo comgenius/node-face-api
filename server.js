@@ -212,7 +212,7 @@ function analyzeLookingAway(detection) {
     normalizedEyeDistance: 0.32,
     yaw: 0.15,
     distanceRatio: 0.2,
-    eyeVerticalSkew: 0.1,
+    eyeVerticalSkew: 0.12,
   };
 
   const lookingAway =
