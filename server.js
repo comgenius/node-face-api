@@ -23,7 +23,10 @@ try {
 
 const app = express();
 app.use(cors());
-app.use(bodyParser.json({ limit: "10mb" }));
+app.use((req, res, next) => {
+  const limit = req.path === "/api/check-video-surveillance" ? "40mb" : "10mb";
+  return bodyParser.json({ limit })(req, res, next);
+});
 app.use(express.static("public"));
 
 // simple health check endpoint for container orchestration
@@ -421,6 +424,136 @@ app.post("/api/looking-away", async (req, res) => {
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: "Looking away detection failed" });
+  }
+});
+
+const SURVEILLANCE_MATCH_DISTANCE = 0.53;
+const SURVEILLANCE_BATCH_LIMIT = 12;
+
+function gazeInputFromDetection(detected) {
+  const positions = detected.landmarks && detected.landmarks.positions;
+  if (!positions) {
+    return null;
+  }
+  return {
+    landmarks: positions.map((point) => ({ x: point.x, y: point.y })),
+    box: {
+      width: detected.detection.box.width,
+      height: detected.detection.box.height,
+    },
+  };
+}
+
+/**
+ * One image, one pass. Stop at the first malpractice hit:
+ * no face, then multiple faces, then looking away, then mismatch.
+ */
+async function firstSurveillanceIssue(imageSource, refDescriptor) {
+  const image = await loadImageFromSource(imageSource);
+  const options = new faceapi.SsdMobilenetv1Options({ minConfidence: 0.5 });
+
+  tf.engine().startScope();
+  try {
+    const detections = await faceapi
+      .detectAllFaces(image, options)
+      .withFaceLandmarks()
+      .withFaceDescriptors();
+
+    if (!detections || detections.length === 0) {
+      return { issue: "not_detected" };
+    }
+    if (detections.length > 1) {
+      return { issue: "multiple_faces", count: detections.length };
+    }
+
+    const gaze = gazeInputFromDetection(detections[0]);
+    if (gaze) {
+      const analysis = analyzeLookingAway(gaze);
+      if (analysis.lookingAway) {
+        return { issue: "looking_away" };
+      }
+    }
+
+    if (refDescriptor) {
+      const distance = faceapi.euclideanDistance(refDescriptor, detections[0].descriptor);
+      if (distance > SURVEILLANCE_MATCH_DISTANCE) {
+        return {
+          issue: "mismatch",
+          similarity: 1 - distance,
+        };
+      }
+    }
+
+    return { issue: null };
+  } finally {
+    tf.engine().endScope();
+  }
+}
+
+app.post("/api/check-video-surveillance", async (req, res) => {
+  try {
+    const referenceImage = req.body && req.body.referenceImage;
+    const images = req.body && req.body.images;
+    if (!referenceImage || !Array.isArray(images) || images.length === 0) {
+      return res.status(400).json({
+        error: "referenceImage and a non-empty images array are required",
+      });
+    }
+
+    const options = new faceapi.SsdMobilenetv1Options({ minConfidence: 0.5 });
+    const refDescriptor = await getFaceDescriptor(referenceImage, options, { cache: true });
+    if (!refDescriptor) {
+      return res.status(400).json({ error: "Face not detected in reference image" });
+    }
+
+    const batch = images.slice(0, SURVEILLANCE_BATCH_LIMIT);
+    const flagged = [];
+    const errors = [];
+    const processedIds = [];
+
+    for (let index = 0; index < batch.length; index += 1) {
+      const item = batch[index];
+      const imageSource = typeof item === "string" ? item : item && item.image;
+      const id = item && typeof item === "object" && item.id != null
+        ? String(item.id)
+        : String(index);
+      const capturedAt = item && typeof item === "object" ? item.capturedAt || null : null;
+
+      if (!imageSource) {
+        errors.push({ id, index, error: "Image is required" });
+        processedIds.push(id);
+        continue;
+      }
+
+      try {
+        const result = await firstSurveillanceIssue(imageSource, refDescriptor);
+        processedIds.push(id);
+        if (result.issue) {
+          flagged.push({
+            id,
+            index,
+            issue: result.issue,
+            capturedAt,
+            count: result.count,
+            similarity: result.similarity,
+          });
+        }
+      } catch (err) {
+        console.error("check-video-surveillance image failed", id, err);
+        errors.push({ id, index, error: "Image check failed" });
+      }
+    }
+
+    return res.json({
+      checked: processedIds.length,
+      flagged,
+      errors,
+      processedIds,
+      truncated: images.length > batch.length,
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Video surveillance check failed" });
   }
 });
 
